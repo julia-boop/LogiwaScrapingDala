@@ -91,7 +91,7 @@ def get_file():
 
     input_element = driver.find_element(By.XPATH, "(//input[@class='form-control'])[1]")
 
-    input_element.send_keys("Dala")
+    input_element.send_keys("Nude Lucy")
     input_element.send_keys(Keys.ENTER)
 
     time.sleep(3)

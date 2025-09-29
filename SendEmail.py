@@ -41,147 +41,101 @@
 
 
 
-# SendEmail.py
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.base import MIMEBase
-from email import encoders
+from email.mime.base import MIMEBase  # kept only to avoid breaking imports elsewhere
 import os
 import time
+import base64
 import datetime
 import mimetypes
-import requests  # HTTPS email API
-import smtplib
-import ssl
+import requests  # <— HTTPS API client
 
 
-def _as_recipient_list(receiver_email: str):
-    parts = []
+def _as_recipient_list(value: str):
+    """Accept 'a@x.com, b@y.com; c@z.com' or single email and return a clean list."""
+    if not value:
+        return []
     for sep in [",", ";"]:
-        receiver_email = receiver_email.replace(sep, " ")
-    for p in receiver_email.split():
-        if "@" in p:
-            parts.append(p.strip())
-    return parts or [receiver_email.strip()]
+        value = value.replace(sep, " ")
+    return [p.strip() for p in value.split() if "@" in p]
 
 
-def _mime_for(path: str) -> str:
+def _attachment_dict(path: str) -> dict:
+    """Build Resend attachment dict with base64 content."""
+    with open(path, "rb") as f:
+        raw = f.read()
+    b64 = base64.b64encode(raw).decode("ascii")
+    # MIME type is optional for Resend; include if we can guess it
     mt, _ = mimetypes.guess_type(path)
-    return mt or "application/octet-stream"
+    att = {"filename": os.path.basename(path), "content": b64}
+    if mt:
+        att["type"] = mt
+    return att
 
 
-def _send_via_resend(sender_email: str, receiver_email: str, subject: str, body: str, file_path: str) -> bool:
+def send_email_with_attachment(
+    sender_email: str,
+    receiver_email: str,
+    subject: str,
+    body: str,
+    file_path: str,
+    smtp_server: str,   # ignored for HTTPS API
+    smtp_port,          # ignored for HTTPS API
+    login: str,         # ignored for HTTPS API
+    password: str,      # ignored for HTTPS API
+) -> bool:
+    """Send via Resend HTTPS API (port 443). Returns True on success."""
     api_key = os.getenv("RESEND_API_KEY")
     if not api_key:
-        print("[RESEND] RESEND_API_KEY not set; skipping Resend path.")
+        print("[RESEND] ERROR: RESEND_API_KEY is not set")
+        return False
+
+    if not sender_email:
+        print("[RESEND] ERROR: SENDER_EMAIL not provided")
         return False
 
     recipients = _as_recipient_list(receiver_email)
-    files = []
-    if file_path and os.path.exists(file_path):
-        files = [
-            (
-                "attachments",
-                (os.path.basename(file_path), open(file_path, "rb"), _mime_for(file_path)),
-            )
-        ]
-        print(f"[RESEND] Attachment prepared: {file_path}")
-    else:
-        print(f"[RESEND] File not found: {file_path}")
+    if not recipients:
+        print("[RESEND] ERROR: receiver_email is empty/invalid")
         return False
 
-    data = {
-        "from": sender_email,       # e.g. "Reports <reports@yourdomain.com>"
-        "to": recipients,           # list of strings
-        "subject": subject,
-        "text": body,
+    if not file_path or not os.path.exists(file_path):
+        print(f"[RESEND] ERROR: attachment not found at {file_path}")
+        return False
+
+    payload = {
+        "from": sender_email,                # must belong to a verified sender/domain in Resend
+        "to": recipients,                    # list of strings
+        "subject": subject or "",
+        "text": body or "",
+        "attachments": [_attachment_dict(file_path)],
     }
 
-    # simple retries
+    # Optional: make replies go to your personal inbox
+    reply_to = os.getenv("REPLY_TO_EMAIL")
+    if reply_to:
+        payload["reply_to"] = [reply_to]
+
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    # Simple retries with backoff
     for attempt in range(1, 4):
         try:
             r = requests.post(
                 "https://api.resend.com/emails",
-                headers={"Authorization": f"Bearer {api_key}"},
-                data=data,
-                files=files,
+                json=payload,               # IMPORTANT: JSON, not multipart
+                headers=headers,
                 timeout=20,
             )
-            if r.status_code >= 400:
+            if r.status_code < 300:
+                print(f"[RESEND] Sent OK at {datetime.datetime.now()} id={r.json().get('id')}")
+                return True
+            else:
                 print(f"[RESEND] API error {r.status_code}: {r.text}")
-                time.sleep(2 * attempt)
-                continue
-            print(f"[RESEND] Email sent OK at {datetime.datetime.now()}")
-            return True
         except Exception as e:
             print(f"[RESEND] Attempt {attempt} failed: {e}")
+
+        if attempt < 3:
             time.sleep(2 * attempt)
 
     print("[RESEND] Giving up after retries.")
     return False
-
-
-def _send_via_smtp(sender_email, receiver_email, subject, body, file_path, smtp_server, smtp_port, login, password) -> bool:
-    """
-    Legacy SMTP path (kept for compatibility). This will still fail if your host blocks SMTP egress.
-    """
-    message = MIMEMultipart()
-    message["From"] = sender_email
-    message["To"] = receiver_email
-    message["Subject"] = subject
-    message.attach(MIMEText(body, "plain"))
-
-    if file_path and os.path.exists(file_path):
-        with open(file_path, "rb") as attachment:
-            part = MIMEBase("application", "octet-stream")
-            part.set_payload(attachment.read())
-        encoders.encode_base64(part)
-        part.add_header("Content-Disposition", f"attachment; filename={os.path.basename(file_path)}")
-        message.attach(part)
-    else:
-        print(f"[SMTP] File not found: {file_path}")
-        return False
-
-    try:
-        port = int(smtp_port)
-    except Exception:
-        port = 587
-
-    try:
-        ctx = ssl.create_default_context()
-        with smtplib.SMTP(smtp_server, port, timeout=20) as server:
-            server.ehlo()
-            server.starttls(context=ctx)
-            server.ehlo()
-            server.login(login, password)
-            server.send_message(message)
-        print(f"[SMTP] Email sent successfully! at {datetime.datetime.now()}")
-        return True
-    except Exception as e:
-        print(f"[SMTP] Failed to send email: {e} {datetime.datetime.now()}")
-        return False
-
-
-def send_email_with_attachment(
-    sender_email,
-    receiver_email,
-    subject,
-    body,
-    file_path,
-    smtp_server,
-    smtp_port,
-    login,
-    password,
-):
-    """
-    Preferred path: Resend API (HTTPS, port 443). If RESEND_API_KEY is unset, falls back to SMTP.
-    """
-    if os.getenv("RESEND_API_KEY"):
-        ok = _send_via_resend(sender_email, receiver_email, subject, body, file_path)
-        if ok:
-            return
-        # If Resend failed for any reason, stop here (most common issue: unverified sender).
-        return
-
-    # Fallback if you deliberately want SMTP when API key is missing.
-    _send_via_smtp(sender_email, receiver_email, subject, body, file_path, smtp_server, smtp_port, login, password)
